@@ -1,0 +1,8 @@
+# Dependency directories
+node_modules/
+
+# Test application
+src/server.ts
+
+# Typescript compiler output
+dist/
