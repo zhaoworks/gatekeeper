@@ -1,4 +1,5 @@
 {
+  "exclude": ["**/*.spec.ts"],
   "compilerOptions": {
     // Enable latest features
     "lib": ["ESNext", "DOM"],
