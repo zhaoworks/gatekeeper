@@ -1,46 +1,133 @@
-import { describe, it, expect } from 'bun:test'
+import { expect, test, describe } from 'bun:test';
+import gatekeeper, { customRule, GatekeeperUnauthorizedError } from '../lib';
 
-import gatekeeper, { GatekeeperUnauthorizedError } from '../lib'
+describe('Gatekeeper', () => {
+  test('should create a gatekeeper instance', () => {
+    const instance = gatekeeper({
+      capture: (x) => x as { userId: string },
+      rules: [],
+    });
 
-const FAILED_ERROR = new Error('Something is wrong...')
+    expect(instance).toHaveProperty('rules');
+    expect(instance).toHaveProperty('trust');
+  });
 
-describe('gatekeeper', () => {
-	const { rules, trust } = gatekeeper({
-		capture: (type) => type as { authorization: string },
-		context: (type) => type as { role?: string } & { error?: boolean },
-		rules: [
-			['organization', async ({ authorization }) => ({ authorization, id: 1 })],
-			['user', async ({}, x) => ({ id: 1, role: x?.role })],
-			['error', async (_unused, ctx) => { if (ctx?.error === true) throw FAILED_ERROR }],
-			['hide', async () => {}],
-		]
-	})
-	
-	it('does not have extra rules', () => {
-		expect(rules).toHaveLength(4)
-	})
+  test('should pass all rules and return expected results', async () => {
+    const instance = gatekeeper({
+      capture: (x: unknown) => x as { userId: string },
+      rules: [
+        customRule(
+          'checkUserId',
+          (params: { userId: string }) => params.userId === 'admin',
+        ),
+        customRule('getRole', (params: { userId: string }) =>
+          params.userId === 'admin' ? 'admin' : 'user',
+        ),
+      ],
+    });
 
-	it('apply all ok rules and return object', async () => {
-		const rules = await trust({ authorization: 'Bearer tokn_123123' })
+    const result = await instance.trust({ userId: 'admin' });
+    expect(result).toEqual({
+      checkUserId: true,
+      getRole: 'admin',
+    });
+  });
 
-		expect(rules).toMatchObject({
-			organization: { id: 1 },
-			user: { id: 1 },
-		})
-	})
-	
-	it('apply fail rule and return object immediately', async () => {
-		const fallibleTrust = async () => await trust({ authorization: 'Bearer tokn_123123' }, { error: true })
+  test('should fail on first failing rule', async () => {
+    const instance = gatekeeper({
+      capture: (x: unknown) => x as { userId: string },
+      rules: [
+        customRule('checkUserId', (params: { userId: string }) => {
+          if (params.userId !== 'admin') throw new Error('Not admin');
+          return true;
+        }),
+        customRule('neverReached', () => 'This should not be reached'),
+		customRule('_', (params: { userId: string }) => ({ params }))
+      ],
+    });
 
-		expect(fallibleTrust).toThrowError('UNAUTHORIZED')
-	})
+    await expect(instance.trust({ userId: 'user' })).rejects.toThrow(
+      GatekeeperUnauthorizedError,
+    );
+  });
 
-	it('has extra details when failed', async () => {
-		const fallibleTrust = await trust({ authorization: 'Bearer tokn_123123' }, { error: true })
-			.catch((error: GatekeeperUnauthorizedError) => error) as GatekeeperUnauthorizedError
+  test('should handle async rules', async () => {
+    const instance = gatekeeper({
+      capture: (x: unknown) => x as { userId: string },
+      rules: [
+        customRule('asyncCheck', async (params: { userId: string }) => {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return params.userId === 'admin';
+        }),
+      ],
+    });
 
-		expect(fallibleTrust.rule).toBe('error')
-		expect(fallibleTrust.reason).toBe(FAILED_ERROR)
-	})
-})
+    const result = await instance.trust({ userId: 'admin' });
+    expect(result).toEqual({ asyncCheck: true });
+  });
 
+  test('should use context if provided', async () => {
+    const instance = gatekeeper({
+      capture: (x: unknown) => x as { userId: string },
+      context: (x: unknown) => x as { isSpecialMode: boolean },
+      rules: [
+        customRule(
+          'contextAwareCheck',
+          (params: { userId: string }, context: { isSpecialMode: boolean }) => {
+            if (context?.isSpecialMode) {
+              return 'special';
+            }
+            return params.userId === 'admin' ? 'admin' : 'user';
+          },
+        ),
+      ],
+    });
+
+    const regularResult = await instance.trust({ userId: 'user' });
+    expect(regularResult).toEqual({ contextAwareCheck: 'user' });
+
+    const specialResult = await instance.trust(
+      { userId: 'user' },
+      { isSpecialMode: true },
+    );
+    expect(specialResult).toEqual({ contextAwareCheck: 'special' });
+  });
+
+  test('should handle rules with void return', async () => {
+    const instance = gatekeeper({
+      capture: (x) => x as { userId: string },
+      rules: [
+        customRule('voidRule', () => {
+          /* do nothing */
+        }),
+        customRule('normalRule', () => true),
+      ],
+    });
+
+    const result = await instance.trust({ userId: 'admin' });
+    expect(result).toEqual({ normalRule: true });
+    expect(result).not.toHaveProperty('voidRule');
+  });
+
+  test('should provide correct error information on failure', async () => {
+    const instance = gatekeeper({
+      capture: (x) => x as { userId: string },
+      rules: [
+        customRule('failingRule', () => {
+          throw new Error('Custom error');
+        }),
+      ],
+    });
+
+    try {
+      await instance.trust({ userId: 'admin' });
+    } catch (error) {
+      expect(error).toBeInstanceOf(GatekeeperUnauthorizedError);
+      if (error instanceof GatekeeperUnauthorizedError) {
+        expect(error.message).toBe('UNAUTHORIZED');
+        expect(error.reason.message).toBe('Custom error');
+        expect(error.rule).toBe('failingRule');
+      }
+    }
+  });
+});
